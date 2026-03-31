@@ -1,0 +1,48 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Candle {
+  id         Int         @id @default(autoincrement())
+  symbol     String
+  timeframe  String
+  epoch      Int
+  open       Float
+  high       Float
+  low        Float
+  close      Float
+  createdAt  DateTime    @default(now())
+  indicators Indicator[]
+
+  @@unique([symbol, timeframe, epoch], name: "symbol_timeframe_epoch")
+  @@index([symbol, timeframe, epoch])
+  @@map("Candle")
+}
+
+model Indicator {
+  id              Int      @id @default(autoincrement())
+  candleId        Int
+  candle          Candle   @relation(fields: [candleId], references: [id], onDelete: Cascade)
+  rsi             Float?
+  macd            Float?
+  macdSignal      Float?
+  macdHistogram   Float?
+  bbUpper         Float?
+  bbMiddle        Float?
+  bbLower         Float?
+  ema9            Float?
+  ema21           Float?
+  ema50           Float?
+  stochK          Float?
+  stochD          Float?
+  atr             Float?
+  createdAt       DateTime @default(now())
+
+  @@unique([candleId])
+  @@map("Indicator")
+}

@@ -1,0 +1,14 @@
+﻿node_modules/
+dist/
+.env
+*.db
+*.db.backup
+data/
+backtest-results/
+ml_data/
+models/
+*.csv
+*.json
+*.pkl
+*.png
+*.txt
