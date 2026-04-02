@@ -4,10 +4,10 @@ import { createInterface } from 'readline';
 import prisma from '../database/prisma.client';
 import { IndicatorsService } from '../services/indicators.service';
 
-const SYMBOL       = 'frxGBPJPY';
-const DERIV_SYMBOL = 'frxGBPJPY';
+const SYMBOL         = 'frxGBPJPY';
+const DERIV_SYMBOL   = 'frxGBPJPY';
 const MIN_CONFIDENCE = 0.65;
-const LOT_SIZE       = 0.01;   // micro-lot para demo
+const LOT_SIZE       = 0.01;
 const MAX_OPEN_TRADES = 2;
 
 interface Prediction {
@@ -26,20 +26,6 @@ interface OpenTrade {
   contractId?: string;
 }
 
-const FEATURE_NAMES = [
-  'open','high','low','close',
-  'rsi','macd','macdSignal','macdHistogram',
-  'bbUpper','bbMiddle','bbLower',
-  'ema9','ema21','ema50','stochK','stochD','atr',
-  'close_lag1','close_lag2','close_lag3',
-  'rsi_lag1','rsi_lag2','volume_change',
-  'price_change_1','price_change_3','price_change_5',
-  'close_sma_5','close_sma_10','close_sma_20',
-  'close_std_5','close_std_10',
-  'high_low_ratio','close_to_ema9_ratio','close_to_ema21_ratio',
-  'rsi_momentum','macd_momentum','bb_position','stoch_momentum'
-];
-
 export class LiveTrader {
   private pythonProcess:   ChildProcess | null = null;
   private pythonReady:     boolean = false;
@@ -47,7 +33,6 @@ export class LiveTrader {
   private indicatorsService = new IndicatorsService();
   private openTrades:      OpenTrade[] = [];
 
-  // Historial para calcular lag features en tiempo real
   private priceHistory: number[] = [];
   private rsiHistory:   number[] = [];
 
@@ -64,26 +49,20 @@ export class LiveTrader {
 
       rl.on('line', (line) => {
         line = line.trim();
-
         if (line === 'READY') {
           this.pythonReady = true;
           console.log('🐍 predict_server.py listo');
           resolve();
           return;
         }
-
-        // Respuestas de predicción
         try {
           const results: Prediction[] = JSON.parse(line);
-          // El servidor siempre responde 1 predicción en live
-          const key = 'live';
-          const resolver = this.pendingResolves.get(key);
+          const resolver = this.pendingResolves.get('live');
           if (resolver) {
-            this.pendingResolves.delete(key);
+            this.pendingResolves.delete('live');
             resolver(results[0]);
           }
         } catch {
-          // línea de error del servidor
           console.error('⚠️ Python error:', line);
         }
       });
@@ -91,33 +70,29 @@ export class LiveTrader {
       this.pythonProcess.stderr!.on('data', (d) =>
         process.stderr.write(`[Python] ${d}`)
       );
-
       this.pythonProcess.on('exit', (code) => {
-        console.log(`⚠️ Python process exited with code ${code}`);
+        console.log(`⚠️ Python process exited: ${code}`);
         this.pythonReady = false;
       });
-
       setTimeout(() => reject(new Error('Python server timeout')), 15_000);
     });
   }
 
   // ══════════════════════════════════════
-  // PREDECIR CON UNA VELA
+  // PREDECIR
   // ══════════════════════════════════════
   private async predict(features: number[]): Promise<Prediction> {
-    if (!this.pythonReady || !this.pythonProcess) {
+    if (!this.pythonReady || !this.pythonProcess)
       throw new Error('Python server not ready');
-    }
 
     return new Promise((resolve) => {
       this.pendingResolves.set('live', resolve);
-      const payload = JSON.stringify([features]) + '\n';
-      this.pythonProcess!.stdin!.write(payload);
+      this.pythonProcess!.stdin!.write(JSON.stringify([features]) + '\n');
     });
   }
 
   // ══════════════════════════════════════
-  // CONSTRUIR FEATURES DE UNA VELA
+  // CONSTRUIR FEATURES
   // ══════════════════════════════════════
   private buildFeatures(candle: any, ind: any): number[] {
     const close = candle.close;
@@ -140,10 +115,10 @@ export class LiveTrader {
       return Math.sqrt(arr.reduce((s, v) => s + (v - m) ** 2, 0) / arr.length);
     };
 
-    const lag1 = n >= 2 ? h[n-2] : close;
-    const lag2 = n >= 3 ? h[n-3] : close;
-    const lag3 = n >= 4 ? h[n-4] : close;
-    const lag5 = n >= 6 ? h[n-6] : close;
+    const lag1  = n >= 2 ? h[n-2] : close;
+    const lag2  = n >= 3 ? h[n-3] : close;
+    const lag3  = n >= 4 ? h[n-4] : close;
+    const lag5  = n >= 6 ? h[n-6] : close;
     const rLag1 = n >= 2 ? r[n-2] : rsi;
     const rLag2 = n >= 3 ? r[n-3] : rsi;
 
@@ -169,7 +144,7 @@ export class LiveTrader {
       ind.atr           ?? 0.001,
       lag1, lag2, lag3,
       rLag1, rLag2,
-      0,   // volume_change
+      0,
       lag1 !== 0 ? (close - lag1) / lag1 : 0,
       lag3 !== 0 ? (close - lag3) / lag3 : 0,
       lag5 !== 0 ? (close - lag5) / lag5 : 0,
@@ -186,49 +161,65 @@ export class LiveTrader {
   }
 
   // ══════════════════════════════════════
-  // PROCESAR VELA NUEVA (llamado cada minuto)
+  // PROCESAR VELA NUEVA
   // ══════════════════════════════════════
   async onNewCandle(candle: any, derivApi: any): Promise<void> {
-    // 1. Calcular indicadores y guardar en DB
-    await this.indicatorsService.calculateIndicators(SYMBOL, '60', 60);
+    // 1. Calcular indicadores (200 velas para cubrir siempre la más nueva)
+    await this.indicatorsService.calculateIndicators(SYMBOL, '60', 200);
 
- const candleDb = await prisma.candle.findFirst({
+    // 2. Buscar el candle en DB y su indicador asociado
+    //    Buscamos el epoch exacto; si no existe, tomamos el más reciente
+    const candleDb = await prisma.candle.findFirst({
       where:   { symbol: SYMBOL, timeframe: '60', epoch: Number(candle.epoch) },
       include: { indicators: true },
-      orderBy: { epoch: 'desc' },
     });
 
-    const ind = candleDb?.indicators?.[0];
+    // Fallback: indicador de la vela más reciente con indicadores calculados
+    const ind = candleDb?.indicators?.[0] ?? await (async () => {
+      const latest = await prisma.candle.findFirst({
+        where:   { symbol: SYMBOL, timeframe: '60' },
+        include: { indicators: true },
+        orderBy: { epoch: 'desc' },
+      });
+      // Solo usar si el indicador tiene RSI calculado
+      const latestInd = latest?.indicators?.[0];
+      return latestInd?.rsi ? latestInd : null;
+    })();
 
     if (!ind?.rsi || !ind?.ema9) {
-      console.log('⏳ Indicadores no disponibles aún...');
+      console.log(`⏳ Indicadores no listos para epoch ${candle.epoch}, esperando siguiente vela...`);
       return;
     }
 
-    // 2. Construir features y predecir
+    const time = new Date().toLocaleTimeString();
+    console.log(`✅ Indicadores OK — RSI: ${ind.rsi?.toFixed(1)} | EMA9: ${ind.ema9?.toFixed(3)}`);
+
+    // 3. Construir features y predecir
     const features = this.buildFeatures(candle, ind);
     const pred     = await this.predict(features);
 
-    const dirLabel = ['⬇️ DOWN', '➡️ NEUTRAL', '⬆️  UP'][pred.prediction];
-    const time     = new Date().toLocaleTimeString();
+    const dirLabel = ['⬇️ DOWN', '➡️ NEUTRAL', '⬆️ UP'][pred.prediction];
+    console.log(`\n[${time}] ${SYMBOL} | ${dirLabel} | Conf: ${(pred.confidence * 100).toFixed(1)}% | Probs: [${pred.probabilities.map(p => (p*100).toFixed(0)).join('%, ')}%]`);
 
-    console.log(`\n[${time}] ${SYMBOL} | ${dirLabel} | Conf: ${(pred.confidence * 100).toFixed(1)}%`);
-
-    // 3. Gestión de trades abiertos — cerrar si hay señal contraria
+    // 4. Gestión de trades abiertos
     await this.manageOpenTrades(candle.close, pred, derivApi);
 
-    // 4. Abrir trade si señal direccional con alta confianza
+    // 5. Abrir trade si hay señal con alta confianza
     if (pred.confidence >= MIN_CONFIDENCE && pred.prediction !== 1) {
       if (this.openTrades.length < MAX_OPEN_TRADES) {
         await this.openTrade(candle, ind, pred, derivApi);
       } else {
         console.log('⏸️  Max trades abiertos alcanzado');
       }
+    } else if (pred.prediction === 1) {
+      console.log('⏸️  Señal NEUTRAL — sin operación');
+    } else {
+      console.log(`⏸️  Confianza insuficiente (${(pred.confidence*100).toFixed(1)}% < ${MIN_CONFIDENCE*100}%)`);
     }
   }
 
   // ══════════════════════════════════════
-  // ABRIR TRADE EN DERIV (DEMO)
+  // ABRIR TRADE EN DERIV
   // ══════════════════════════════════════
   private async openTrade(
     candle: any,
@@ -238,20 +229,15 @@ export class LiveTrader {
   ): Promise<void> {
     const direction = pred.prediction === 2 ? 'LONG' : 'SHORT';
     const atr       = ind.atr ?? (candle.close * 0.0002);
-    const sl        = direction === 'LONG'
-      ? candle.close - atr * 1.5
-      : candle.close + atr * 1.5;
-    const tp        = direction === 'LONG'
-      ? candle.close + atr * 2.5
-      : candle.close - atr * 2.5;
+    const sl  = direction === 'LONG' ? candle.close - atr * 1.5 : candle.close + atr * 1.5;
+    const tp  = direction === 'LONG' ? candle.close + atr * 2.5 : candle.close - atr * 2.5;
 
     console.log(`\n🎯 Abriendo ${direction} | Entry: ${candle.close} | SL: ${sl.toFixed(5)} | TP: ${tp.toFixed(5)}`);
 
     try {
-      // ── Deriv API: pedir proposal ──────────────────────
       const proposal = await api.proposal({
         proposal:      1,
-        amount:        10,           // $10 por trade en demo
+        amount:        10,
         basis:         'stake',
         contract_type: direction === 'LONG' ? 'CALL' : 'PUT',
         currency:      'USD',
@@ -266,7 +252,7 @@ export class LiveTrader {
           price: proposal.proposal.ask_price,
         });
 
-        const trade: OpenTrade = {
+        this.openTrades.push({
           id:         buy.buy.contract_id.toString(),
           direction,
           entryPrice: candle.close,
@@ -274,25 +260,22 @@ export class LiveTrader {
           takeProfit: tp,
           entryEpoch: candle.epoch,
           contractId: buy.buy.contract_id.toString(),
-        };
+        });
 
-        this.openTrades.push(trade);
-
-        // Guardar en DB
         await prisma.trade.create({
-        data: {
-          symbol:       SYMBOL,
-          direction,
-          entryEpoch:   Number(candle.epoch),   // ✅ Int
-          entryPrice:   candle.close,
-          quantity:     LOT_SIZE,
-          stopLoss:     sl,
-          takeProfit:   tp,
-          mlConfidence: pred.confidence,
-          contractId:   buy.buy.contract_id.toString(),
-          status:       'OPEN',
-        },
-      });
+          data: {
+            symbol:       SYMBOL,
+            direction,
+            entryEpoch:   Number(candle.epoch),
+            entryPrice:   candle.close,
+            quantity:     LOT_SIZE,
+            stopLoss:     sl,
+            takeProfit:   tp,
+            mlConfidence: pred.confidence,
+            contractId:   buy.buy.contract_id.toString(),
+            status:       'OPEN',
+          },
+        });
 
         console.log(`✅ Trade abierto — Contract ID: ${buy.buy.contract_id}`);
       }
@@ -307,7 +290,7 @@ export class LiveTrader {
   private async manageOpenTrades(
     currentPrice: number,
     pred: Prediction,
-    api:  any
+    _api: any
   ): Promise<void> {
     for (const trade of [...this.openTrades]) {
       const hitSL = trade.direction === 'LONG'
@@ -316,8 +299,6 @@ export class LiveTrader {
       const hitTP = trade.direction === 'LONG'
         ? currentPrice >= trade.takeProfit
         : currentPrice <= trade.takeProfit;
-
-      // Señal contraria con alta confianza
       const reversal =
         (trade.direction === 'LONG'  && pred.prediction === 0 && pred.confidence >= MIN_CONFIDENCE) ||
         (trade.direction === 'SHORT' && pred.prediction === 2 && pred.confidence >= MIN_CONFIDENCE);
