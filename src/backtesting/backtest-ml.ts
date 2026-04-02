@@ -633,11 +633,11 @@ export class MLBacktester {
 
 async function main() {
   const backtester = new MLBacktester({
-    symbols:        ['frxEURUSD','frxGBPUSD','frxUSDJPY','frxGBPJPY','frxAUDUSD'],
+    symbols:        ['frxGBPJPY'],
     startDate:      new Date('2024-01-01'),
     endDate:        new Date('2025-12-31'),
     initialBalance: 10_000,
-    minConfidence:  0.70,
+    minConfidence:  0.65,
     maxOpenTrades:  2,
     slippagePips:   0.3,
     timeframe:      '60',

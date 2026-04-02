@@ -46,3 +46,24 @@ model Indicator {
   @@unique([candleId])
   @@map("Indicator")
 }
+
+model Trade {
+  id           Int      @id @default(autoincrement())
+  symbol       String
+  direction    String   // 'LONG' | 'SHORT'
+  entryEpoch   Int
+  entryPrice   Float
+  exitEpoch    Int?
+  exitPrice    Float?
+  quantity     Float
+  stopLoss     Float?
+  takeProfit   Float?
+  pnl          Float?
+  mlConfidence Float?
+  status       String   @default("OPEN")  // 'OPEN' | 'CLOSED'
+  contractId   String?
+  createdAt    DateTime @default(now())
+
+  @@index([symbol, status])
+  @@map("Trade")
+}

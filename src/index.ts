@@ -1,159 +1,142 @@
-import DerivAPI from '@deriv/deriv-api';
+// src/index.ts
 import dotenv from 'dotenv';
+import DerivAPI from '@deriv/deriv-api';
 import prisma from './database/prisma.client';
-import { IndicatorsService } from './services/indicators.service';
-import FeaturesService from './services/features.service';
+import { LiveTrader } from './trading/live-trader';
 
 dotenv.config();
 
-const APP_ID = parseInt(process.env.DERIV_APP_ID || '0');
+const APP_ID    = parseInt(process.env.DERIV_APP_ID    || '0');
 const API_TOKEN = process.env.DERIV_API_TOKEN || '';
+const SYMBOL    = 'frxGBPJPY';
 
 async function main() {
-  console.log('🚀 Iniciando sistema de trading ML...\n');
+  console.log('🚀 Trading Bot ML — GBPJPY\n');
 
-  const connection = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`);
+  // 1. Iniciar servidor Python
+  const trader = new LiveTrader();
+  await trader.startPythonServer();
+
+  // 2. Conectar a Deriv
+  const connection = new WebSocket(
+    `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`
+  );
   const api = new DerivAPI({ connection });
 
-  connection.onopen = async () => {
-    try {
-      console.log('🔌 Conexión establecida');
-      console.log('🔑 Autorizando...');
-      
-      connection.send(JSON.stringify({
-        authorize: API_TOKEN
-      }));
-
-    } catch (error: any) {
-      console.error('❌ Error en autorización:', error.message);
-      connection.close();
-      await prisma.$disconnect();
-      process.exit(1);
-    }
+  connection.onopen = () => {
+    console.log('🔌 Conectado a Deriv');
+    connection.send(JSON.stringify({ authorize: API_TOKEN }));
   };
 
-  let authorized = false;
+  let lastEpoch = 0;
 
   connection.onmessage = async (msg) => {
-    try {
-      const data = JSON.parse(msg.data.toString());
-      
-      if (data.authorize && !authorized) {
-        authorized = true;
-        console.log(`✅ Usuario: ${data.authorize.email}`);
-        console.log(`✅ Balance: ${data.authorize.balance} ${data.authorize.currency}\n`);
+    const data = JSON.parse(msg.data.toString());
 
-        console.log('📊 Descargando velas históricas de R_10 (1 minuto)...');
-        
-        connection.send(JSON.stringify({
-          ticks_history: 'R_10',
-          count: 500, // Aumentamos a 500 para tener más datos
-          end: 'latest',
-          style: 'candles',
-          granularity: 60
-        }));
+    // Autorización exitosa → suscribir a velas de 1M
+    if (data.authorize) {
+      console.log(`✅ Autorizado: ${data.authorize.email}`);
+      console.log(`💰 Balance: ${data.authorize.balance} ${data.authorize.currency}\n`);
+
+      // Suscripción a velas en tiempo real (1 minuto)
+      connection.send(JSON.stringify({
+        ticks_history: SYMBOL,
+        style:         'candles',
+        granularity:   60,
+        count:         100,       // warm-up para indicadores
+        end:           'latest',
+        subscribe:     1,
+      }));
+    }
+
+    // Velas históricas de warm-up
+    if (data.candles && !data.subscription) {
+      console.log(`📊 Warm-up: ${data.candles.length} velas cargadas`);
+      // Guardar en DB para calcular indicadores
+    for (const c of data.candles) {
+  await prisma.candle.upsert({
+    where: {
+      symbol_timeframe_epoch: {        // ✅ nombre correcto
+        symbol:    SYMBOL,
+        epoch:     Number(c.epoch),    // ✅ Int no BigInt
+        timeframe: '60'
       }
+    },
+    create: {
+      symbol:    SYMBOL,
+      epoch:     Number(c.epoch),
+      open:      Number(c.open),
+      high:      Number(c.high),
+      low:       Number(c.low),
+      close:     Number(c.close),
+      timeframe: '60'
+    },
+    update: {
+      open:  Number(c.open),
+      high:  Number(c.high),
+      low:   Number(c.low),
+      close: Number(c.close)
+    }
+  });
+}
+      console.log('✅ Warm-up completo — monitoreando mercado...\n');
+    }
 
-      if (data.candles) {
-        const candles = data.candles;
-        console.log(`✅ Descargadas ${candles.length} velas\n`);
+    // Nueva vela en tiempo real
+    if (data.ohlc) {
+      const candle = {
+        epoch: parseInt(data.ohlc.open_time),
+        open:  parseFloat(data.ohlc.open),
+        high:  parseFloat(data.ohlc.high),
+        low:   parseFloat(data.ohlc.low),
+        close: parseFloat(data.ohlc.close),
+      };
 
-        console.log('💾 Guardando velas en SQLite...');
-        let savedCount = 0;
+      // Solo procesar velas cerradas (epoch cambia cada minuto)
+      if (candle.epoch !== lastEpoch) {
+        lastEpoch = candle.epoch;
 
-        for (const candle of candles) {
-          await prisma.candle.upsert({
-            where: {
-              symbol_epoch_timeframe: {
-                symbol: 'R_10',
-                epoch: BigInt(candle.epoch),
-                timeframe: '1m',
-              },
-            },
-            create: {
-              symbol: 'R_10',
-              epoch: BigInt(candle.epoch),
-              open: Number(candle.open),
-              high: Number(candle.high),
-              low: Number(candle.low),
-              close: Number(candle.close),
-              timeframe: '1m',
-            },
-            update: {
-              open: Number(candle.open),
-              high: Number(candle.high),
-              low: Number(candle.low),
-              close: Number(candle.close),
-            },
-          });
-          savedCount++;
-        }
-        console.log(`✅ ${savedCount} velas guardadas\n`);
+      await prisma.candle.upsert({
+  where: {
+    symbol_timeframe_epoch: {          // ✅
+      symbol:    SYMBOL,
+      epoch:     Number(candle.epoch), // ✅
+      timeframe: '60'
+    }
+  },
+  create: {
+    symbol:    SYMBOL,
+    epoch:     Number(candle.epoch),
+    open:      candle.open,
+    high:      candle.high,
+    low:       candle.low,
+    close:     candle.close,
+    timeframe: '60'
+  },
+  update: {
+    open:  candle.open,
+    high:  candle.high,
+    low:   candle.low,
+    close: candle.close
+  }
+});
 
-        // Calcular indicadores
-        const indicatorsService = new IndicatorsService();
-        await indicatorsService.calculateIndicators('R_10', '1m', 500);
-
-        // ============================================
-        // NUEVO: GENERAR FEATURES DE ML
-        // ============================================
-        const featuresService = new FeaturesService();
-        await featuresService.generateFeatures('R_10', '1m');
-        
-        // Exportar a CSV para entrenamiento
-        await featuresService.exportToCSV('R_10', '1m', 'training_data.csv');
-
-        // Mostrar algunas features de ejemplo
-        console.log('\n📊 Ejemplos de features generadas:\n');
-        const sampleFeatures = await prisma.mLFeature.findMany({
-          take: 3,
-          orderBy: { epoch: 'desc' },
-        });
-
-        for (const feature of sampleFeatures) {
-          const date = new Date(Number(feature.epoch) * 1000);
-          console.log(`${date.toLocaleTimeString()}`);
-          console.log(`  Close Price: ${feature.closePrice.toFixed(2)}`);
-          console.log(`  RSI Normalized: ${feature.rsiNormalized?.toFixed(3) || 'N/A'}`);
-          console.log(`  BB Position: ${feature.bbPosition?.toFixed(3) || 'N/A'}`);
-          console.log(`  Trend Direction: ${feature.trendDirection === 1 ? 'UP' : feature.trendDirection === -1 ? 'DOWN' : 'NEUTRAL'}`);
-          console.log(`  Bullish Pattern: ${feature.isBullishEngulfing ? 'YES' : 'NO'}`);
-          console.log(`  Volatility: ${feature.volatilityRegime}`);
-          console.log(`  Target (1m): ${feature.priceDirectionNext1m === 1 ? 'UP' : feature.priceDirectionNext1m === -1 ? 'DOWN' : 'NEUTRAL'}`);
-          console.log(`  Profit Potential: ${feature.profitPotential?.toFixed(3)}%`);
-          console.log('');
-        }
-
-        console.log('\n🎉 Pipeline completo ejecutado!');
-        console.log(`📊 Velas: ${await prisma.candle.count()}`);
-        console.log(`📈 Indicadores: ${await prisma.indicator.count()}`);
-        console.log(`🧠 Features ML: ${await prisma.mLFeature.count()}\n`);
-
-        connection.close();
-        await prisma.$disconnect();
-        process.exit(0);
+        await trader.onNewCandle(candle, api);
       }
+    }
 
-      if (data.error) {
-        console.error('❌ Error de API:', data.error.message);
-        connection.close();
-        await prisma.$disconnect();
-        process.exit(1);
-      }
-
-    } catch (error: any) {
-      console.error('❌ Error procesando respuesta:', error.message);
-      connection.close();
-      await prisma.$disconnect();
-      process.exit(1);
+    if (data.error) {
+      console.error('❌ Error Deriv:', data.error.message);
     }
   };
 
-  connection.onerror = async (error) => {
-    console.error('❌ Error de conexión:', error);
+  // Graceful shutdown
+  process.on('SIGINT', async () => {
+    console.log('\n🛑 Deteniendo bot...');
+    trader.stop();
     await prisma.$disconnect();
-    process.exit(1);
-  };
+    process.exit(0);
+  });
 }
 
-main();
+main().catch(console.error);
