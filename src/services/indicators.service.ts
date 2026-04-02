@@ -13,15 +13,18 @@ export class IndicatorsService {
   async calculateIndicators(
     symbol: string, 
     timeframe: string, 
-    limit: number = 100
+    limit: number = 200
   ) {
     console.log(`📊 Calculando indicadores para ${symbol} ${timeframe}...`);
 
-    const candles = await prisma.candle.findMany({
-      where: { symbol, timeframe },
-      orderBy: { epoch: 'asc' },
-      take: limit,
+    // ✅ DESC + reverse = las N más RECIENTES en orden cronológico
+    // Esto garantiza que la vela nueva siempre está incluida
+    const candlesDesc = await prisma.candle.findMany({
+      where:   { symbol, timeframe },
+      orderBy: { epoch: 'desc' },
+      take:    limit,
     });
+    const candles = candlesDesc.reverse(); // asc para calcular indicadores
 
     if (candles.length < 50) {
       console.warn('⚠️ No hay suficientes velas para calcular indicadores (mínimo 50)');
